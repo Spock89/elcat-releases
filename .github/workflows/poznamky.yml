@@ -1,0 +1,44 @@
+# Ruční oprava textu u už vydané verze: znovu načte RELEASE_NOTES.md ze
+# soukromého zdroje a přepíše popis vydání i „notes" v latest.json.
+# Zip ani podpis se nemění (podpis se týká jen zipu).
+name: Opravit novinky
+
+on:
+  workflow_dispatch:
+    inputs:
+      verze:
+        description: "Verze (např. 1.2.0); prázdné = nejnovější vydání"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  poznamky:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+          VERZE: ${{ inputs.verze }}
+        run: |
+          set -e
+          if [ -z "$VERZE" ]; then
+            TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)
+          else
+            TAG="v$VERZE"
+          fi
+          curl -sfL -H "Authorization: Bearer $SOURCE_TOKEN" -H "Accept: application/vnd.github.raw" \
+            "https://api.github.com/repos/Spock89/elcat/contents/RELEASE_NOTES.md" > RELEASE_NOTES.md
+          awk '/^Novinky ve verzi /{on=1} /^Ve verzi /{exit} on' RELEASE_NOTES.md > notes.md
+          awk 'NR==1{print;next} /^Ve verzi /{exit} {print}' RELEASE_NOTES.md > release.md
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file release.md
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" -p latest.json
+          python3 - <<'PY'
+          import json
+          d = json.load(open("latest.json", encoding="utf-8"))
+          d["notes"] = open("notes.md", encoding="utf-8").read().strip()
+          json.dump(d, open("latest.json", "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+          PY
+          cat latest.json
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" latest.json --clobber

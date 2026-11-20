@@ -1,0 +1,107 @@
+# Vydání ELCAT pro aktualizace v aplikaci.
+#
+# Běží TADY, ve veřejném repozitáři, protože veřejné repozitáře mají
+# minuty na macOS zdarma. Zdrojový kód si stáhne ze soukromého
+# Spock89/elcat (token SOURCE_TOKEN, jen pro čtení).
+#
+# Jednou za dvě hodiny (a ručně) se podívá na číslo verze v projektu.
+# Sestavuje JEN tehdy, když ta verze tady ještě není vydaná.
+#
+# Secrets v tomhle repozitáři:
+#   SOURCE_TOKEN        token se čtením obsahu Spock89/elcat
+#   UPDATE_SIGNING_KEY  soukromý klíč Ed25519 (base64); veřejný je v aplikaci
+name: Vydání
+
+on:
+  schedule:
+    - cron: "17 */2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  verze:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      nova: ${{ steps.v.outputs.nova }}
+    steps:
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+        run: |
+          if [ -z "$SOURCE_TOKEN" ]; then echo "Chybí SOURCE_TOKEN."; echo "nova=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          V=$(curl -sfL -H "Authorization: Bearer $SOURCE_TOKEN" -H "Accept: application/vnd.github.raw" \
+              "https://api.github.com/repos/Spock89/elcat/contents/ELCAT.xcodeproj/project.pbxproj" \
+              | grep -m1 -o 'MARKETING_VERSION = [0-9.]*' | awk '{print $3}')
+          [ -n "$V" ] || { echo "Verzi se nepodařilo zjistit."; exit 1; }
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          if gh release view "v$V" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Verze $V už je vydaná."; echo "nova=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Nová verze $V."; echo "nova=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  vydani:
+    needs: verze
+    if: needs.verze.outputs.nova == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Spock89/elcat
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+
+      - name: Sestavit (Release, Intel + Apple Silicon, ad-hoc podpis)
+        working-directory: src
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project ELCAT.xcodeproj -scheme ELCAT -configuration Release \
+            -destination 'generic/platform=macOS' -derivedDataPath build \
+            ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="-" DEVELOPMENT_TEAM="" \
+            build 2>&1 | tee build.log | grep -E "error:|BUILD (SUCCEEDED|FAILED)" || true
+          grep -q "BUILD SUCCEEDED" build.log
+
+      - name: Zabalit a podepsat
+        working-directory: src
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+          VERSION: ${{ needs.verze.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          APP=build/Build/Products/Release/ELCAT.app
+          codesign --verify --deep "$APP" || codesign --force --deep -s - "$APP"
+          mkdir -p ../out
+          ZIP="../out/ELCAT_${VERSION}.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+          SHA=$(shasum -a 256 "$ZIP" | awk '{print $1}')
+          SIG=$(swift nastroje/podpis.swift "$ZIP")
+          awk '/^Novinky ve verzi /{on=1} /^Ve verzi /{exit} on' RELEASE_NOTES.md > ../out/notes.md
+          awk 'NR==1{print;next} /^Ve verzi /{exit} {print}' RELEASE_NOTES.md > ../out/release.md
+          VERSION="$VERSION" SHA="$SHA" SIG="$SIG" python3 - <<'PY'
+          import json, os, datetime
+          v=os.environ["VERSION"]
+          url=f"https://github.com/{os.environ['REPO']}/releases/download/v{v}/ELCAT_{v}.zip"
+          json.dump({"version": v,
+                     "notes": open("../out/notes.md", encoding="utf-8").read().strip(),
+                     "url": url, "sha256": os.environ["SHA"], "signature": os.environ["SIG"],
+                     "minimumSystem": "13.0",
+                     "pub_date": datetime.datetime.utcnow().isoformat() + "Z"},
+                    open("../out/latest.json", "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+          PY
+          cat ../out/latest.json
+
+      - name: Vydat
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.verze.outputs.version }}
+        run: |
+          gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" \
+            "out/ELCAT_${VERSION}.zip" out/latest.json \
+            --title "ELCAT $VERSION" --notes-file out/release.md
